@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import yaml
+from uuid import getnode as get_mac
 from pypuppetdb import connect
 
 # Try to use the fastest json lib available
@@ -36,30 +37,35 @@ except ImportError:
         import json
 
 
-# First file found will have precedence
-CONFIG_FILES = [
-    os.path.expanduser(os.environ.get('ANSIBLE_PUPPETDB_CONFIG',
-                                      "~/puppetdb.yml")),
-    os.getcwd() + '/puppetdb.yml',
-    '/etc/ansible/puppetdb.yml'
-]
-
+mac = get_mac()
 
 def load_config():
     """
     Looks for and loads yml configuration files
     """
-    for path in CONFIG_FILES:
-        if os.path.exists(path):
-            try:
-                with open(path) as config_file:
-                    config = yaml.safe_load(config_file.read())
-                    return config
-            except IOError as error:
-                print("I/O error ({0}): {1}".format(path, error.strerror))
-                sys.exit(1)
+    script_path = os.path.dirname(os.path.realpath(__file__))
+    config_file_path = script_path + '/puppetdb.yml'
 
-    return None
+    if os.path.exists(config_file_path):
+        try:
+            with open(config_file_path) as fp:
+                config = yaml.safe_load(fp)
+        except yaml.YAMLError as err1:
+            raise RuntimeError('ERROR: Could not parse YAML config file ' + str(err1))
+    else:
+        config = {
+            "host": "localhost",
+            "timeout": 10,
+            "cache_duration": 15,
+            "group_by": None,
+            "port": 8080,
+            "ssl_verify": False,
+            "ssl_key": None,
+            "ssl_cert": None,
+            "group_by_tag": None
+        }
+
+    return config
 
 
 class PuppetdbInventory(object):
@@ -67,8 +73,10 @@ class PuppetdbInventory(object):
     A class that wraps around pypuppetdb to return ansible-compatible host
     lists and their hostvars (facts) based on data provided by PuppetDB.
     """
+
     def __init__(self, refresh):
         self.config = load_config()
+        self.mac = ':'.join(("%012X" % mac)[i:i+2] for i in range(0, 12, 2))
         if not self.config:
             sys.exit('Error: Could not load any config files: {0}'
                      .format(', '.join(CONFIG_FILES)))
@@ -84,7 +92,7 @@ class PuppetdbInventory(object):
 
         self.puppetdb = connect(**puppetdb_config)
 
-        self.cache_file = self.config.get('cache_file')
+        self.cache_file = os.path.expanduser('~') + '/ansible-inventory-puppetdb.cache'
         self.cache_duration = self.config.get('cache_duration')
         self.refresh = refresh
 
@@ -106,6 +114,8 @@ class PuppetdbInventory(object):
         """
         with open(self.cache_file, 'w') as cache_file:
             cache_file.write(groups)
+        # change file permission so that only current user has access to this.
+        os.chmod(self.cache_file, 0600)
 
     def get_host_list(self):
         """
@@ -133,9 +143,9 @@ class PuppetdbInventory(object):
         Fetch all fact and their values for a given host
         """
         node = self.puppetdb.node(host)
-        facts = dict((fact.name,fact.value) for fact in node.facts())
+        facts = dict((fact.name, fact.value) for fact in node.facts())
 
-        facts['ansible_ssh_host'] = node.fact('fqdn').value
+        facts['ansible_host'] = node.fact('ipaddress').value
 
         return facts
 
@@ -161,6 +171,7 @@ class PuppetdbInventory(object):
         hostvars = collections.defaultdict(dict)
 
         groups['all']['hosts'] = list()
+        hostvars_local = {}
 
         group_by = self.config.get('group_by')
         group_by_tag = self.config.get('group_by_tag')
@@ -183,7 +194,7 @@ class PuppetdbInventory(object):
             if group_by_tag:
                 for entry in group_by_tag:
                     for resource_type, tag in entry.iteritems():
-                        tag_lookup = { resource_type: tag }
+                        tag_lookup = {resource_type: tag}
                         tagged_hosts = self.fetch_tag_results(tag_lookup)
                         group_key = tag
                         if server in tagged_hosts:
@@ -192,9 +203,16 @@ class PuppetdbInventory(object):
                             groups[group_key]['hosts'].append(server)
 
             groups['all']['hosts'].append(server)
-            hostvars[server] = self.fetch_host_facts(server)
+            host_fact = self.fetch_host_facts(server)
+            hostvars[server] = host_fact
+            if host_fact['macaddress'].upper() == self.mac:
+                hostvars_local = host_fact
             groups['_meta'] = {'hostvars': hostvars}
 
+        groups['all']['hosts'].append('local')
+        groups['_meta']['hostvars']['local'] = hostvars_local
+        groups['_meta']['hostvars']['local']['ansible_connection'] = 'local'
+        groups['_meta']['hostvars']['local']['ansible_host'] = '127.0.0.1'
         return json.dumps(groups)
 
 
@@ -225,6 +243,7 @@ def main():
 
     if args.host:
         print(inventory.get_host_detail(args.host))
+
 
 if __name__ == '__main__':
     main()
